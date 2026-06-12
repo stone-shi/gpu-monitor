@@ -47,7 +47,6 @@ def load_hardware_data():
         """
         df = pd.read_sql(query, conn)
         conn.close()
-        # Convert timestamp to local time
         if not df.empty:
             df['timestamp'] = pd.to_datetime(df['timestamp'])
         return df
@@ -75,31 +74,78 @@ def load_llm_data():
         return pd.DataFrame()
 
 @st.cache_data(ttl=5)
-def load_aggregation_data():
+def load_overall_gpu_active():
     try:
         conn = get_db_connection()
         query = """
         SELECT 
-            model_name, 
-            COUNT(*) as total_calls, 
-            SUM(prompt_tokens) as total_prompt_tokens,
-            SUM(completion_tokens) as total_completion_tokens,
-            SUM(total_tokens) as total_tokens, 
-            ROUND(AVG(tokens_per_sec)::numeric, 2) as avg_speed 
-        FROM llm_token_metrics 
-        GROUP BY model_name
+            COUNT(*) as total_samples,
+            SUM(CASE WHEN gpu_utilization > 50 THEN 1 ELSE 0 END) as active_samples
+        FROM gpu_hardware_metrics
         """
         df = pd.read_sql(query, conn)
         conn.close()
+        if not df.empty and df.iloc[0]['total_samples'] > 0:
+            total = df.iloc[0]['total_samples']
+            active = df.iloc[0]['active_samples'] or 0
+            return (active / total) * 100
+        return 0.0
+    except Exception as e:
+        st.error(f"Error loading overall GPU active metric: {e}")
+        return 0.0
+
+@st.cache_data(ttl=5)
+def load_daily_tokens():
+    try:
+        conn = get_db_connection()
+        query = """
+        SELECT 
+            date_trunc('day', timestamp) AS day,
+            SUM(prompt_tokens) AS prompt_tokens,
+            SUM(completion_tokens) AS completion_tokens,
+            SUM(total_tokens) AS total_tokens
+        FROM llm_token_metrics 
+        GROUP BY day
+        ORDER BY day ASC
+        """
+        df = pd.read_sql(query, conn)
+        conn.close()
+        if not df.empty:
+            df['day'] = pd.to_datetime(df['day']).dt.strftime('%Y-%m-%d')
         return df
     except Exception as e:
-        st.error(f"Error loading aggregation data: {e}")
+        st.error(f"Error loading daily token data: {e}")
+        return pd.DataFrame()
+
+@st.cache_data(ttl=5)
+def load_monthly_tokens():
+    try:
+        conn = get_db_connection()
+        query = """
+        SELECT 
+            date_trunc('month', timestamp) AS month,
+            SUM(prompt_tokens) AS prompt_tokens,
+            SUM(completion_tokens) AS completion_tokens,
+            SUM(total_tokens) AS total_tokens
+        FROM llm_token_metrics 
+        GROUP BY month
+        ORDER BY month ASC
+        """
+        df = pd.read_sql(query, conn)
+        conn.close()
+        if not df.empty:
+            df['month'] = pd.to_datetime(df['month']).dt.strftime('%Y-%m')
+        return df
+    except Exception as e:
+        st.error(f"Error loading monthly token data: {e}")
         return pd.DataFrame()
 
 # Load datasets
 df_hw = load_hardware_data()
 df_llm = load_llm_data()
-df_agg = load_aggregation_data()
+df_daily = load_daily_tokens()
+df_monthly = load_monthly_tokens()
+overall_gpu_active = load_overall_gpu_active()
 
 # Metric summary row
 col1, col2, col3, col4, col5 = st.columns(5)
@@ -114,19 +160,18 @@ else:
     col2.metric("VRAM Used", "N/A")
     col3.metric("GPU Temperature", "N/A")
 
+col4.metric("Overall GPU Active (>50%)", f"{overall_gpu_active:.1f}%")
+
 if not df_llm.empty:
-    total_requests = len(df_llm)
     avg_speed = df_llm['tokens_per_sec'].mean()
-    col4.metric("Logged Inferences", f"{total_requests}")
     col5.metric("Avg Generation Speed", f"{avg_speed:.2f} t/s")
 else:
-    col4.metric("Logged Inferences", "0")
     col5.metric("Avg Generation Speed", "0.00 t/s")
 
 st.markdown("---")
 
 # Layout Tabs
-tab1, tab2, tab3 = st.tabs(["🖥️ GPU Hardware Performance", "🤖 Live LLM Inferences", "📈 Aggregated Model Analytics"])
+tab1, tab2, tab3 = st.tabs(["🖥️ GPU Hardware Performance", "🤖 Live LLM Inferences", "📈 Historical Token Usage"])
 
 with tab1:
     st.subheader("GPU Metrics Over Time")
@@ -180,14 +225,39 @@ with tab2:
         st.info("No LLM inferences logged yet. Generate text using LM Studio to populate.")
 
 with tab3:
-    st.subheader("Model Benchmark Comparisons")
-    if not df_agg.empty:
-        st.dataframe(df_agg, use_container_width=True)
-        
-        st.markdown("**Average Generation Speed by Model (tokens/second)**")
-        st.bar_chart(df_agg.set_index("model_name")[["avg_speed"]])
-    else:
-        st.info("No aggregated statistics available.")
+    st.subheader("Historical Token Usage Patterns")
+    
+    col_t1, col_t2 = st.columns(2)
+    
+    with col_t1:
+        st.markdown("**Daily Token Usage**")
+        if not df_daily.empty:
+            # Display daily tokens as stacked bar chart
+            st.bar_chart(
+                df_daily.set_index("day")[["prompt_tokens", "completion_tokens"]],
+                use_container_width=True
+            )
+            st.dataframe(
+                df_daily.sort_values("day", ascending=False)[["day", "prompt_tokens", "completion_tokens", "total_tokens"]],
+                use_container_width=True
+            )
+        else:
+            st.info("No daily token usage data found.")
+            
+    with col_t2:
+        st.markdown("**Monthly Token Usage**")
+        if not df_monthly.empty:
+            # Display monthly tokens as stacked bar chart
+            st.bar_chart(
+                df_monthly.set_index("month")[["prompt_tokens", "completion_tokens"]],
+                use_container_width=True
+            )
+            st.dataframe(
+                df_monthly.sort_values("month", ascending=False)[["month", "prompt_tokens", "completion_tokens", "total_tokens"]],
+                use_container_width=True
+            )
+        else:
+            st.info("No monthly token usage data found.")
 
 # Real-time auto-refresh executor (placed at the end to sleep after rendering)
 if auto_refresh:

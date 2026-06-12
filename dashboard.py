@@ -18,6 +18,27 @@ st.sidebar.title("⚙️ Settings")
 auto_refresh = st.sidebar.checkbox("🔄 Auto-refresh page", value=True, help="Toggle real-time database polling.")
 refresh_interval = st.sidebar.slider("Polling Interval (seconds)", min_value=2, max_value=30, value=5)
 
+# Load and display version info if available
+version_hash = "unknown"
+version_time = "unknown"
+version_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "version.txt")
+if os.path.exists(version_path):
+    try:
+        with open(version_path, "r") as f:
+            for line in f:
+                if "=" in line:
+                    k, v = line.strip().split("=", 1)
+                    if k == "hash":
+                        version_hash = v
+                    elif k == "timestamp":
+                        version_time = v
+    except Exception:
+        pass
+
+st.sidebar.markdown("---")
+st.sidebar.markdown(f"**Version**: `{version_hash}`")
+st.sidebar.markdown(f"**Built**: `{version_time}`")
+
 # Database connection helper
 def get_db_connection():
     user = os.environ.get("POSTGRES_USER", "postgres")

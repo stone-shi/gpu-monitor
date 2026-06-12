@@ -15,6 +15,7 @@ RUN pip install --no-cache-dir \
 
 # Copy the dashboard code
 COPY dashboard.py /app/dashboard.py
+COPY version.txt* /app/
 
 # Expose Streamlit's default port
 EXPOSE 8501

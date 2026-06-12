@@ -13,6 +13,11 @@ st.set_page_config(
 st.title("📊 GPU & LLM Studio Telemetry Dashboard")
 st.markdown("Real-time monitoring of local hardware utilization and LLM inference telemetry.")
 
+# Sidebar Controls for Auto-Refresh
+st.sidebar.title("⚙️ Settings")
+auto_refresh = st.sidebar.checkbox("🔄 Auto-refresh page", value=True, help="Toggle real-time database polling.")
+refresh_interval = st.sidebar.slider("Polling Interval (seconds)", min_value=2, max_value=30, value=5)
+
 # Database connection helper
 def get_db_connection():
     user = os.environ.get("POSTGRES_USER", "postgres")
@@ -183,3 +188,9 @@ with tab3:
         st.bar_chart(df_agg.set_index("model_name")[["avg_speed"]])
     else:
         st.info("No aggregated statistics available.")
+
+# Real-time auto-refresh executor (placed at the end to sleep after rendering)
+if auto_refresh:
+    import time
+    time.sleep(refresh_interval)
+    st.rerun()

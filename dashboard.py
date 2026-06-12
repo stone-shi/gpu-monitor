@@ -1,0 +1,185 @@
+import os
+import streamlit as st
+import pandas as pd
+import psycopg2
+
+# Set page config
+st.set_page_config(
+    page_title="GPU & LLM Telemetry Dashboard",
+    page_icon="📊",
+    layout="wide"
+)
+
+st.title("📊 GPU & LLM Studio Telemetry Dashboard")
+st.markdown("Real-time monitoring of local hardware utilization and LLM inference telemetry.")
+
+# Database connection helper
+def get_db_connection():
+    user = os.environ.get("POSTGRES_USER", "postgres")
+    password = os.environ.get("POSTGRES_PASSWORD", "")
+    host = os.environ.get("DB_HOST", "localhost")
+    port = os.environ.get("DB_PORT", "5432")
+    dbname = os.environ.get("DB_NAME", "gpu-monitor")
+    
+    return psycopg2.connect(
+        host=host,
+        port=port,
+        user=user,
+        password=password,
+        database=dbname
+    )
+
+# Cache data queries for performance (refresh every 5 seconds)
+@st.cache_data(ttl=5)
+def load_hardware_data():
+    try:
+        conn = get_db_connection()
+        query = """
+        SELECT timestamp, gpu_utilization, vram_used_mb, temperature_c 
+        FROM gpu_hardware_metrics 
+        ORDER BY timestamp DESC 
+        LIMIT 300
+        """
+        df = pd.read_sql(query, conn)
+        conn.close()
+        # Convert timestamp to local time
+        if not df.empty:
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+        return df
+    except Exception as e:
+        st.error(f"Error loading GPU hardware metrics: {e}")
+        return pd.DataFrame()
+
+@st.cache_data(ttl=5)
+def load_llm_data():
+    try:
+        conn = get_db_connection()
+        query = """
+        SELECT timestamp, model_name, prompt_tokens, completion_tokens, total_tokens, tokens_per_sec, prompt_text, response_text 
+        FROM llm_token_metrics 
+        ORDER BY timestamp DESC 
+        LIMIT 100
+        """
+        df = pd.read_sql(query, conn)
+        conn.close()
+        if not df.empty:
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+        return df
+    except Exception as e:
+        st.error(f"Error loading LLM token metrics: {e}")
+        return pd.DataFrame()
+
+@st.cache_data(ttl=5)
+def load_aggregation_data():
+    try:
+        conn = get_db_connection()
+        query = """
+        SELECT 
+            model_name, 
+            COUNT(*) as total_calls, 
+            SUM(prompt_tokens) as total_prompt_tokens,
+            SUM(completion_tokens) as total_completion_tokens,
+            SUM(total_tokens) as total_tokens, 
+            ROUND(AVG(tokens_per_sec)::numeric, 2) as avg_speed 
+        FROM llm_token_metrics 
+        GROUP BY model_name
+        """
+        df = pd.read_sql(query, conn)
+        conn.close()
+        return df
+    except Exception as e:
+        st.error(f"Error loading aggregation data: {e}")
+        return pd.DataFrame()
+
+# Load datasets
+df_hw = load_hardware_data()
+df_llm = load_llm_data()
+df_agg = load_aggregation_data()
+
+# Metric summary row
+col1, col2, col3, col4, col5 = st.columns(5)
+
+if not df_hw.empty:
+    latest_hw = df_hw.iloc[0]
+    col1.metric("GPU Utilization", f"{latest_hw['gpu_utilization']}%")
+    col2.metric("VRAM Used", f"{latest_hw['vram_used_mb']:,} MB")
+    col3.metric("GPU Temperature", f"{latest_hw['temperature_c']}°C")
+else:
+    col1.metric("GPU Utilization", "N/A")
+    col2.metric("VRAM Used", "N/A")
+    col3.metric("GPU Temperature", "N/A")
+
+if not df_llm.empty:
+    total_requests = len(df_llm)
+    avg_speed = df_llm['tokens_per_sec'].mean()
+    col4.metric("Logged Inferences", f"{total_requests}")
+    col5.metric("Avg Generation Speed", f"{avg_speed:.2f} t/s")
+else:
+    col4.metric("Logged Inferences", "0")
+    col5.metric("Avg Generation Speed", "0.00 t/s")
+
+st.markdown("---")
+
+# Layout Tabs
+tab1, tab2, tab3 = st.tabs(["🖥️ GPU Hardware Performance", "🤖 Live LLM Inferences", "📈 Aggregated Model Analytics"])
+
+with tab1:
+    st.subheader("GPU Metrics Over Time")
+    if not df_hw.empty:
+        # Sort ascending for chronological graph plots
+        df_hw_sorted = df_hw.sort_values("timestamp")
+        
+        # Dual columns for graphs
+        g_col1, g_col2 = st.columns(2)
+        with g_col1:
+            st.markdown("**GPU Core Utilization (%)**")
+            st.line_chart(df_hw_sorted.set_index("timestamp")[["gpu_utilization"]], height=250)
+        with g_col2:
+            st.markdown("**VRAM Usage (MB)**")
+            st.line_chart(df_hw_sorted.set_index("timestamp")[["vram_used_mb"]], height=250)
+            
+        st.markdown("**Core Temperature (°C)**")
+        st.line_chart(df_hw_sorted.set_index("timestamp")[["temperature_c"]], height=200)
+    else:
+        st.info("No GPU metrics captured yet. Ensure the python daemon is running.")
+
+with tab2:
+    st.subheader("Recent Generation Transcripts")
+    if not df_llm.empty:
+        # Format timestamps for display
+        df_llm_disp = df_llm.copy()
+        df_llm_disp['timestamp'] = df_llm_disp['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S')
+        
+        st.dataframe(
+            df_llm_disp[["timestamp", "model_name", "prompt_tokens", "completion_tokens", "total_tokens", "tokens_per_sec"]],
+            use_container_width=True
+        )
+        
+        st.markdown("### 🔍 Generation Transcript Inspector")
+        # Selector for generation log
+        selected_index = st.selectbox(
+            "Select a request to inspect:",
+            df_llm_disp.index,
+            format_func=lambda idx: f"[{df_llm_disp.loc[idx, 'timestamp']}] {df_llm_disp.loc[idx, 'model_name']} ({df_llm_disp.loc[idx, 'total_tokens']} tokens)"
+        )
+        
+        selected_run = df_llm_disp.loc[selected_index]
+        det_col1, det_col2 = st.columns(2)
+        with det_col1:
+            st.markdown("**Prompt Text**")
+            st.text_area("prompt_viewer", selected_run['prompt_text'], height=250, label_visibility="collapsed")
+        with det_col2:
+            st.markdown("**Response Text**")
+            st.text_area("response_viewer", selected_run['response_text'], height=250, label_visibility="collapsed")
+    else:
+        st.info("No LLM inferences logged yet. Generate text using LM Studio to populate.")
+
+with tab3:
+    st.subheader("Model Benchmark Comparisons")
+    if not df_agg.empty:
+        st.dataframe(df_agg, use_container_width=True)
+        
+        st.markdown("**Average Generation Speed by Model (tokens/second)**")
+        st.bar_chart(df_agg.set_index("model_name")[["avg_speed"]])
+    else:
+        st.info("No aggregated statistics available.")

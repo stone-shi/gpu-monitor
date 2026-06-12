@@ -1,0 +1,47 @@
+version: '3.8'
+
+services:
+  # ===========================================================================
+  # CONFIGURATION A: Running the Dashboard connected to your host's existing database
+  # ===========================================================================
+  dashboard:
+    build: .
+    container_name: telemetry_dashboard
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-736fea418879e23b24c09570d4f4c557}
+      - DB_NAME=${DB_NAME:-gpu-monitor}
+      - DB_PORT=${DB_PORT:-5432}
+      # Connects to the database running on your localhost host machine:
+      - DB_HOST=host.docker.internal
+    extra_hosts:
+      # Directs host.docker.internal to resolve to the host's local IP address
+      - "host.docker.internal:host-gateway"
+
+  # ===========================================================================
+  # CONFIGURATION B (Example): Running a unified/isolated multi-container setup
+  #
+  # If you want to use this self-contained deployment, stop your host-level
+  # postgres server, uncomment the services below, and change Configuration A's
+  # 'DB_HOST' environment variable to 'db'.
+  # ===========================================================================
+  # db:
+  #   image: postgres:15-alpine
+  #   container_name: telemetry_postgres
+  #   restart: always
+  #   environment:
+  #     POSTGRES_USER: ${POSTGRES_USER:-postgres}
+  #     POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-736fea418879e23b24c09570d4f4c557}
+  #     POSTGRES_DB: ${DB_NAME:-gpu-monitor}
+  #   ports:
+  #     - "5432:5432"
+  #   volumes:
+  #     - pgdata:/var/lib/postgresql/data
+  #     # Automatically runs init_db.sql to initialize database schemas on startup
+  #     - ./init_db.sql:/docker-entrypoint-initdb.d/init_db.sql
+  #
+  # volumes:
+  #   pgdata:

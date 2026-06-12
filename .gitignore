@@ -1,0 +1,12 @@
+# Database connection and environment secrets
+.env
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# System or editor configurations
+.DS_Store
+.vscode/
+.idea/

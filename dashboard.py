@@ -221,8 +221,14 @@ with tab2:
         df_llm_disp = df_llm.copy()
         df_llm_disp['timestamp'] = df_llm_disp['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S')
         
+        # Format numeric columns with commas for readability
+        df_llm_fmt = df_llm_disp[["timestamp", "model_name", "prompt_tokens", "completion_tokens", "total_tokens", "tokens_per_sec"]].copy()
+        for col in ["prompt_tokens", "completion_tokens", "total_tokens"]:
+            df_llm_fmt[col] = df_llm_fmt[col].apply(lambda x: f"{x:,}")
+        df_llm_fmt["tokens_per_sec"] = df_llm_fmt["tokens_per_sec"].apply(lambda x: f"{x:,.2f}")
+        
         st.dataframe(
-            df_llm_disp[["timestamp", "model_name", "prompt_tokens", "completion_tokens", "total_tokens", "tokens_per_sec"]],
+            df_llm_fmt,
             use_container_width=True
         )
         
@@ -231,7 +237,7 @@ with tab2:
         selected_index = st.selectbox(
             "Select a request to inspect:",
             df_llm_disp.index,
-            format_func=lambda idx: f"[{df_llm_disp.loc[idx, 'timestamp']}] {df_llm_disp.loc[idx, 'model_name']} ({df_llm_disp.loc[idx, 'total_tokens']} tokens)"
+            format_func=lambda idx: f"[{df_llm_disp.loc[idx, 'timestamp']}] {df_llm_disp.loc[idx, 'model_name']} ({df_llm_disp.loc[idx, 'total_tokens']:,} tokens)"
         )
         
         selected_run = df_llm_disp.loc[selected_index]
@@ -244,6 +250,20 @@ with tab2:
             st.text_area("response_viewer", selected_run['response_text'], height=250, label_visibility="collapsed")
     else:
         st.info("No LLM inferences logged yet. Generate text using LM Studio to populate.")
+
+def format_human(n):
+    """Format a number into human-readable K, M, B notation."""
+    if n is None:
+        return "0"
+    n = float(n)
+    if abs(n) >= 1_000_000_000:
+        return f"{n / 1_000_000_000:.2f}B"
+    elif abs(n) >= 1_000_000:
+        return f"{n / 1_000_000:.2f}M"
+    elif abs(n) >= 1_000:
+        return f"{n / 1_000:.1f}K"
+    else:
+        return f"{int(n)}"
 
 with tab3:
     st.subheader("Historical Token Usage Patterns")
@@ -258,8 +278,12 @@ with tab3:
                 df_daily.set_index("day")[["prompt_tokens", "completion_tokens"]],
                 use_container_width=True
             )
+            # Format table numbers to K/M/B notation
+            df_daily_fmt = df_daily.sort_values("day", ascending=False)[["day", "prompt_tokens", "completion_tokens", "total_tokens"]].copy()
+            for col in ["prompt_tokens", "completion_tokens", "total_tokens"]:
+                df_daily_fmt[col] = df_daily_fmt[col].apply(format_human)
             st.dataframe(
-                df_daily.sort_values("day", ascending=False)[["day", "prompt_tokens", "completion_tokens", "total_tokens"]],
+                df_daily_fmt,
                 use_container_width=True
             )
         else:
@@ -273,8 +297,12 @@ with tab3:
                 df_monthly.set_index("month")[["prompt_tokens", "completion_tokens"]],
                 use_container_width=True
             )
+            # Format table numbers to K/M/B notation
+            df_monthly_fmt = df_monthly.sort_values("month", ascending=False)[["month", "prompt_tokens", "completion_tokens", "total_tokens"]].copy()
+            for col in ["prompt_tokens", "completion_tokens", "total_tokens"]:
+                df_monthly_fmt[col] = df_monthly_fmt[col].apply(format_human)
             st.dataframe(
-                df_monthly.sort_values("month", ascending=False)[["month", "prompt_tokens", "completion_tokens", "total_tokens"]],
+                df_monthly_fmt,
                 use_container_width=True
             )
         else:

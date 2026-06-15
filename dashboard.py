@@ -122,6 +122,7 @@ def load_daily_tokens():
         query = """
         SELECT 
             date_trunc('day', timestamp) AS day,
+            COUNT(*) AS requests,
             SUM(prompt_tokens) AS prompt_tokens,
             SUM(completion_tokens) AS completion_tokens,
             SUM(total_tokens) AS total_tokens
@@ -145,6 +146,7 @@ def load_monthly_tokens():
         query = """
         SELECT 
             date_trunc('month', timestamp) AS month,
+            COUNT(*) AS requests,
             SUM(prompt_tokens) AS prompt_tokens,
             SUM(completion_tokens) AS completion_tokens,
             SUM(total_tokens) AS total_tokens
@@ -161,15 +163,30 @@ def load_monthly_tokens():
         st.error(f"Error loading monthly token data: {e}")
         return pd.DataFrame()
 
+@st.cache_data(ttl=5)
+def load_request_count():
+    try:
+        conn = get_db_connection()
+        query = "SELECT COUNT(*) as total_requests FROM llm_token_metrics"
+        df = pd.read_sql(query, conn)
+        conn.close()
+        if not df.empty:
+            return int(df.iloc[0]['total_requests'])
+        return 0
+    except Exception as e:
+        st.error(f"Error loading request count: {e}")
+        return 0
+
 # Load datasets
 df_hw = load_hardware_data()
 df_llm = load_llm_data()
 df_daily = load_daily_tokens()
 df_monthly = load_monthly_tokens()
 overall_gpu_active = load_overall_gpu_active()
+total_requests = load_request_count()
 
 # Metric summary row
-col1, col2, col3, col4, col5 = st.columns(5)
+col1, col2, col3, col4, col5, col6 = st.columns(6)
 
 if not df_hw.empty:
     latest_hw = df_hw.iloc[0]
@@ -182,12 +199,13 @@ else:
     col3.metric("GPU Temperature", "N/A")
 
 col4.metric("Overall GPU Active (>50%)", f"{overall_gpu_active:.1f}%")
+col5.metric("Total Requests", f"{total_requests:,}")
 
 if not df_llm.empty:
     avg_speed = df_llm['tokens_per_sec'].mean()
-    col5.metric("Avg Generation Speed", f"{avg_speed:.2f} t/s")
+    col6.metric("Avg Generation Speed", f"{avg_speed:.2f} t/s")
 else:
-    col5.metric("Avg Generation Speed", "0.00 t/s")
+    col6.metric("Avg Generation Speed", "0.00 t/s")
 
 st.markdown("---")
 
@@ -279,7 +297,8 @@ with tab3:
                 use_container_width=True
             )
             # Format table numbers to K/M/B notation
-            df_daily_fmt = df_daily.sort_values("day", ascending=False)[["day", "prompt_tokens", "completion_tokens", "total_tokens"]].copy()
+            df_daily_fmt = df_daily.sort_values("day", ascending=False)[["day", "requests", "prompt_tokens", "completion_tokens", "total_tokens"]].copy()
+            df_daily_fmt["requests"] = df_daily_fmt["requests"].apply(lambda x: f"{int(x):,}")
             for col in ["prompt_tokens", "completion_tokens", "total_tokens"]:
                 df_daily_fmt[col] = df_daily_fmt[col].apply(format_human)
             st.dataframe(
@@ -298,7 +317,8 @@ with tab3:
                 use_container_width=True
             )
             # Format table numbers to K/M/B notation
-            df_monthly_fmt = df_monthly.sort_values("month", ascending=False)[["month", "prompt_tokens", "completion_tokens", "total_tokens"]].copy()
+            df_monthly_fmt = df_monthly.sort_values("month", ascending=False)[["month", "requests", "prompt_tokens", "completion_tokens", "total_tokens"]].copy()
+            df_monthly_fmt["requests"] = df_monthly_fmt["requests"].apply(lambda x: f"{int(x):,}")
             for col in ["prompt_tokens", "completion_tokens", "total_tokens"]:
                 df_monthly_fmt[col] = df_monthly_fmt[col].apply(format_human)
             st.dataframe(

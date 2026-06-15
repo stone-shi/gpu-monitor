@@ -5,6 +5,7 @@ import time
 import json
 import subprocess
 import threading
+import collections
 import psycopg2
 import pynvml
 
@@ -118,7 +119,10 @@ def lms_log_processing_thread():
     """Thread 2: Consumes LM Studio log stream and commits LLM token and text metrics to database."""
     print("Starting LM Studio Log Processing Thread...", file=sys.stderr)
     conn = None
-    last_prompt = None
+    # Use a FIFO queue to buffer prompts for correct correlation with parallel requests.
+    # When multiple inputs arrive before their outputs (parallel inference), each input
+    # is queued and each output pops the oldest prompt from the front.
+    prompt_queue = collections.deque()
     
     while True:
         proc = None
@@ -155,9 +159,9 @@ def lms_log_processing_thread():
                 
                 event_type = data_obj.get("type")
                 
-                # If it's an input event, save the prompt text and continue
+                # If it's an input event, enqueue the prompt text and continue
                 if event_type == "llm.prediction.input":
-                    last_prompt = data_obj.get("input")
+                    prompt_queue.append(data_obj.get("input"))
                     continue
                 
                 # If it's an output event, process metrics and insert
@@ -173,6 +177,9 @@ def lms_log_processing_thread():
                     tokens_per_sec = stats.get("tokensPerSecond") or stats.get("tokens_per_sec") or stats.get("t/s")
                     
                     response_text = data_obj.get("output")
+                    
+                    # Pop the oldest buffered prompt for this output (FIFO correlation)
+                    matched_prompt = prompt_queue.popleft() if prompt_queue else None
                     
                     # Cast metrics safely
                     try:
@@ -220,12 +227,10 @@ def lms_log_processing_thread():
                                         (model_name, prompt_tokens, completion_tokens, total_tokens, tokens_per_sec, prompt_text, response_text)
                                         VALUES (%s, %s, %s, %s, %s, %s, %s)
                                         """,
-                                        (model_name, prompt_tokens, completion_tokens, total_tokens, tokens_per_sec, last_prompt, response_text)
+                                        (model_name, prompt_tokens, completion_tokens, total_tokens, tokens_per_sec, matched_prompt, response_text)
                                     )
                                 conn.commit()
                                 db_inserted = True
-                                # Clear prompt once successfully logged
-                                last_prompt = None
                             except Exception as e:
                                 print(f"LM Studio Thread DB insertion failed: {e}. Closing connection.", file=sys.stderr)
                                 try:
@@ -251,6 +256,8 @@ def lms_log_processing_thread():
                 except Exception:
                     pass
         
+        # Clear stale prompts on subprocess restart
+        prompt_queue.clear()
         print("LM Studio subprocess connection lost or failed. Re-trying in 5 seconds...", file=sys.stderr)
         time.sleep(5)
 

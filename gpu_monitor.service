@@ -7,6 +7,7 @@ Type=simple
 User=stoneshi
 WorkingDirectory=/home/stoneshi/data/src/stone/gpu-monitor
 Environment="PATH=/home/stoneshi/.lmstudio/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="PYTHONUNBUFFERED=1"
 ExecStart=/usr/bin/python3 /home/stoneshi/data/src/stone/gpu-monitor/gpu_llm_monitor.py
 Restart=always
 RestartSec=5

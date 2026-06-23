@@ -115,13 +115,51 @@ def hardware_polling_thread():
             
         time.sleep(10)
 
+def extract_truncated_json_field(line, field_name):
+    """Helper to extract a string field from a truncated JSON line."""
+    for marker in [f'"{field_name}":"', f'"{field_name}": "']:
+        idx = line.find(marker)
+        if idx != -1:
+            start_idx = idx + len(marker)
+            content = line[start_idx:].rstrip('\r\n')
+            
+            # Handle trailing backslashes to avoid escaping the closing quote we append
+            backslash_count = 0
+            for char in reversed(content):
+                if char == '\\':
+                    backslash_count += 1
+                else:
+                    break
+            if backslash_count % 2 != 0:
+                content = content[:-1]
+                
+            try:
+                return json.loads(f'"{content}"')
+            except json.JSONDecodeError:
+                if content.endswith('"'):
+                    content = content[:-1]
+                    backslash_count = 0
+                    for char in reversed(content):
+                        if char == '\\':
+                            backslash_count += 1
+                        else:
+                            break
+                    if backslash_count % 2 != 0:
+                        content = content[:-1]
+                try:
+                    return json.loads(f'"{content}"')
+                except json.JSONDecodeError:
+                    # Manual fallback unescape
+                    return content.replace('\\n', '\n').replace('\\t', '\t').replace('\\"', '"').replace('\\\\', '\\')
+    return None
+
 def lms_log_processing_thread():
     """Thread 2: Consumes LM Studio log stream and commits LLM token and text metrics to database."""
     print("Starting LM Studio Log Processing Thread...", file=sys.stderr)
     conn = None
-    # Use a FIFO queue to buffer prompts for correct correlation with parallel requests.
+    # Use a FIFO queue to buffer (prompt_text, model_name) for correct correlation with parallel requests.
     # When multiple inputs arrive before their outputs (parallel inference), each input
-    # is queued and each output pops the oldest prompt from the front.
+    # is queued and each output pops the oldest prompt/model from the front.
     prompt_queue = collections.deque()
     
     while True:
@@ -146,65 +184,98 @@ def lms_log_processing_thread():
                 if not line:
                     continue
                 
+                is_truncated = False
+                event_type = None
+                data_obj = {}
+                payload = {}
+                
                 # Try parsing line as JSON payload
                 try:
                     payload = json.loads(line)
+                    data_obj = payload.get("data", {})
+                    if not isinstance(data_obj, dict) or not data_obj:
+                        data_obj = payload
+                    event_type = data_obj.get("type")
                 except json.JSONDecodeError:
-                    continue
-                
-                # Check target fields for token execution reports
-                data_obj = payload.get("data", {})
-                if not isinstance(data_obj, dict) or not data_obj:
-                    data_obj = payload
-                
-                event_type = data_obj.get("type")
+                    is_truncated = True
+                    # Truncated line: identify event type by simple substring
+                    if "llm.prediction.input" in line:
+                        event_type = "llm.prediction.input"
+                    elif "llm.prediction.output" in line:
+                        event_type = "llm.prediction.output"
+                    else:
+                        continue
                 
                 # If it's an input event, enqueue the prompt text and continue
                 if event_type == "llm.prediction.input":
-                    prompt_queue.append(data_obj.get("input"))
+                    if is_truncated:
+                        prompt = extract_truncated_json_field(line, "input")
+                        model_name = None
+                    else:
+                        prompt = data_obj.get("input")
+                        model_name = data_obj.get("modelIdentifier") or data_obj.get("model") or payload.get("model")
+                    
+                    if prompt:
+                        prompt_queue.append((prompt, model_name))
                     continue
                 
                 # If it's an output event, process metrics and insert
                 if event_type == "llm.prediction.output" or "stats" in data_obj or "usage" in data_obj:
-                    stats = data_obj.get("stats", {}) or data_obj.get("usage", {})
-                    if not isinstance(stats, dict):
-                        stats = {}
+                    # Pop the oldest buffered prompt/model for this output (FIFO correlation)
+                    matched_prompt, input_model = prompt_queue.popleft() if prompt_queue else (None, None)
                     
-                    model_name = data_obj.get("modelIdentifier") or data_obj.get("model") or payload.get("model")
-                    prompt_tokens = stats.get("promptTokensCount") or stats.get("prompt_tokens") or stats.get("input_tokens") or stats.get("prompt")
-                    completion_tokens = stats.get("predictedTokensCount") or stats.get("completion_tokens") or stats.get("output_tokens") or stats.get("completion")
-                    total_tokens = stats.get("totalTokensCount") or stats.get("total_tokens")
-                    tokens_per_sec = stats.get("tokensPerSecond") or stats.get("tokens_per_sec") or stats.get("t/s")
-                    
-                    response_text = data_obj.get("output")
-                    
-                    # Pop the oldest buffered prompt for this output (FIFO correlation)
-                    matched_prompt = prompt_queue.popleft() if prompt_queue else None
-                    
-                    # Cast metrics safely
-                    try:
-                        if prompt_tokens is not None:
-                            prompt_tokens = int(prompt_tokens)
-                    except (TypeError, ValueError):
-                        prompt_tokens = None
-                        
-                    try:
-                        if completion_tokens is not None:
-                            completion_tokens = int(completion_tokens)
-                    except (TypeError, ValueError):
-                        completion_tokens = None
-                        
-                    try:
-                        if total_tokens is not None:
-                            total_tokens = int(total_tokens)
-                    except (TypeError, ValueError):
-                        total_tokens = None
-                    
-                    try:
-                        if tokens_per_sec is not None:
-                            tokens_per_sec = float(tokens_per_sec)
-                    except (TypeError, ValueError):
+                    if is_truncated:
+                        response_text = extract_truncated_json_field(line, "output")
+                        model_name = input_model or "unknown"
+                        prompt_tokens = len(matched_prompt) // 4 if matched_prompt else 0
+                        completion_tokens = len(response_text) // 4 if response_text else 0
+                        total_tokens = prompt_tokens + completion_tokens
                         tokens_per_sec = 0.0
+                    else:
+                        stats = data_obj.get("stats", {}) or data_obj.get("usage", {})
+                        if not isinstance(stats, dict):
+                            stats = {}
+                        
+                        model_name = data_obj.get("modelIdentifier") or data_obj.get("model") or payload.get("model") or input_model or "unknown"
+                        prompt_tokens = stats.get("promptTokensCount") or stats.get("prompt_tokens") or stats.get("input_tokens") or stats.get("prompt")
+                        completion_tokens = stats.get("predictedTokensCount") or stats.get("completion_tokens") or stats.get("output_tokens") or stats.get("completion")
+                        total_tokens = stats.get("totalTokensCount") or stats.get("total_tokens")
+                        tokens_per_sec = stats.get("tokensPerSecond") or stats.get("tokens_per_sec") or stats.get("t/s")
+                        response_text = data_obj.get("output")
+                        
+                        # Cast metrics safely
+                        try:
+                            if prompt_tokens is not None:
+                                prompt_tokens = int(prompt_tokens)
+                        except (TypeError, ValueError):
+                            prompt_tokens = None
+                            
+                        try:
+                            if completion_tokens is not None:
+                                completion_tokens = int(completion_tokens)
+                        except (TypeError, ValueError):
+                            completion_tokens = None
+                            
+                        try:
+                            if total_tokens is not None:
+                                total_tokens = int(total_tokens)
+                        except (TypeError, ValueError):
+                            total_tokens = None
+                        
+                        try:
+                            if tokens_per_sec is not None:
+                                tokens_per_sec = float(tokens_per_sec)
+                        except (TypeError, ValueError):
+                            tokens_per_sec = 0.0
+                            
+                        if prompt_tokens is None:
+                            prompt_tokens = len(matched_prompt) // 4 if matched_prompt else 0
+                        if completion_tokens is None:
+                            completion_tokens = len(response_text) // 4 if response_text else 0
+                        if total_tokens is None:
+                            total_tokens = prompt_tokens + completion_tokens
+                        if tokens_per_sec is None:
+                            tokens_per_sec = 0.0
 
                     # If we have minimum valid fields, insert into database
                     if model_name and prompt_tokens is not None and completion_tokens is not None:

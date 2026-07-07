@@ -13,3 +13,9 @@ __pycache__/
 
 # Telemetry version information
 version.txt
+
+# Virtual environment
+.venv/
+
+# Test reports
+test-reports/

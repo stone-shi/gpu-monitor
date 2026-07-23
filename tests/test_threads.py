@@ -2,12 +2,21 @@ import os
 import sys
 import time
 import json
+import base64
 import collections
 import pytest
 from unittest.mock import patch, MagicMock, call
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from gpu_llm_monitor import hardware_polling_thread, lms_log_processing_thread
+from gpu_llm_monitor import (
+    hardware_polling_thread,
+    localai_trace_polling_thread,
+    process_trace,
+    parse_streaming_response,
+    parse_json_response,
+    extract_last_user_message,
+    parse_trace_timestamp,
+)
 
 
 class TestHardwarePollingThread:
@@ -153,43 +162,195 @@ class TestHardwarePollingThread:
         assert args[0][1][1] == 4096
 
 
-class TestLmsLogProcessingThread:
-    def _make_mock_proc(self, lines):
-        proc = MagicMock()
-        proc.stdout.readline.side_effect = lines + [""]
-        proc.terminate.return_value = None
-        proc.wait.return_value = None
-        proc.kill.return_value = None
-        return proc
+def _make_trace(req_body_obj, resp_body_text, path="/v1/chat/completions", status=200,
+                 timestamp="2026-07-23T02:23:43.048034614Z", duration=2_000_000_000):
+    return {
+        "timestamp": timestamp,
+        "duration": duration,
+        "request": {
+            "method": "POST",
+            "path": path,
+            "body": base64.b64encode(json.dumps(req_body_obj).encode()).decode(),
+        },
+        "response": {
+            "status": status,
+            "body": base64.b64encode(resp_body_text.encode()).decode(),
+        },
+    }
+
+
+class TestExtractLastUserMessage:
+    def test_plain_string_content(self):
+        messages = [{"role": "system", "content": "sys"}, {"role": "user", "content": "hello"}]
+        assert extract_last_user_message(messages) == "hello"
+
+    def test_picks_most_recent_user_message(self):
+        messages = [{"role": "user", "content": "first"}, {"role": "assistant", "content": "reply"}, {"role": "user", "content": "second"}]
+        assert extract_last_user_message(messages) == "second"
+
+    def test_multimodal_content_parts(self):
+        messages = [{"role": "user", "content": [{"type": "text", "text": "part one"}, {"type": "image_url", "image_url": {}}]}]
+        assert extract_last_user_message(messages) == "part one"
+
+    def test_no_user_message_returns_none(self):
+        assert extract_last_user_message([{"role": "system", "content": "sys"}]) is None
+
+    def test_non_list_input_returns_none(self):
+        assert extract_last_user_message(None) is None
+
+
+class TestParseTraceTimestamp:
+    def test_truncates_nanoseconds_to_microseconds(self):
+        result = parse_trace_timestamp("2026-07-23T02:23:43.048034614Z")
+        assert result is not None
+        assert result.microsecond == 48034
+
+    def test_none_input(self):
+        assert parse_trace_timestamp(None) is None
+
+    def test_invalid_format(self):
+        assert parse_trace_timestamp("not-a-timestamp") is None
+
+
+class TestParseJsonResponse:
+    def test_extracts_fields(self):
+        body = json.dumps({
+            "id": "abc-123",
+            "model": "qwen3.6-35b-a3b",
+            "choices": [{"message": {"role": "assistant", "content": "hi there"}}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 10, "total_tokens": 15},
+        })
+        trace_id, model_name, response_text, usage = parse_json_response(body)
+        assert trace_id == "abc-123"
+        assert model_name == "qwen3.6-35b-a3b"
+        assert response_text == "hi there"
+        assert usage == {"prompt_tokens": 5, "completion_tokens": 10, "total_tokens": 15}
+
+    def test_invalid_json_returns_none_tuple(self):
+        assert parse_json_response("not json") == (None, None, None, None)
+
+
+class TestParseStreamingResponse:
+    def test_reassembles_content_and_usage_from_chunks(self):
+        chunks = [
+            {"id": "s1", "model": "qwen", "choices": [{"delta": {"content": "Hel"}}]},
+            {"id": "s1", "model": "qwen", "choices": [{"delta": {"content": "lo"}}]},
+            {"id": "s1", "model": "qwen", "choices": [], "usage": {"prompt_tokens": 2, "completion_tokens": 2, "total_tokens": 4}},
+        ]
+        body = "".join(f"data: {json.dumps(c)}\n\n" for c in chunks) + "data: [DONE]\n\n"
+        trace_id, model_name, response_text, usage = parse_streaming_response(body)
+        assert trace_id == "s1"
+        assert model_name == "qwen"
+        assert response_text == "Hello"
+        assert usage == {"prompt_tokens": 2, "completion_tokens": 2, "total_tokens": 4}
+
+
+class TestProcessTrace:
+    def test_non_chat_path_ignored(self):
+        trace = _make_trace({}, "{}", path="/v1/models")
+        assert process_trace(trace) is None
+
+    def test_non_200_status_ignored(self):
+        trace = _make_trace({}, "{}", status=500)
+        assert process_trace(trace) is None
+
+    def test_missing_usage_falls_back_to_length_estimate(self):
+        req = {"model": "qwen", "messages": [{"role": "user", "content": "a" * 40}]}
+        resp = json.dumps({
+            "id": "abc",
+            "model": "qwen",
+            "choices": [{"message": {"role": "assistant", "content": "b" * 20}}],
+        })
+        record = process_trace(_make_trace(req, resp))
+        assert record["prompt_tokens"] == 10
+        assert record["completion_tokens"] == 5
+        assert record["total_tokens"] == 15
+
+    def test_tokens_per_sec_from_duration(self):
+        req = {"model": "qwen", "messages": [{"role": "user", "content": "hi"}]}
+        resp = json.dumps({
+            "id": "abc",
+            "model": "qwen",
+            "choices": [{"message": {"role": "assistant", "content": "hello"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 10, "total_tokens": 11},
+        })
+        record = process_trace(_make_trace(req, resp, duration=5_000_000_000))
+        assert record["tokens_per_sec"] == 2.0
+
+
+class TestLocalAITracePollingThread:
+    @patch("gpu_llm_monitor.time.sleep")
+    @patch("gpu_llm_monitor.fetch_traces")
+    def test_missing_traces_url_exits_immediately(self, mock_fetch, mock_sleep):
+        with patch.dict(os.environ, {}, clear=True):
+            localai_trace_polling_thread()
+        mock_fetch.assert_not_called()
 
     @patch("gpu_llm_monitor.time.sleep")
-    @patch("gpu_llm_monitor.subprocess.Popen")
     @patch("gpu_llm_monitor.get_db_connection")
-    def test_output_event_with_stats(self, mock_db, mock_popen, mock_sleep):
-        log_line = json.dumps({
-            "data": {
-                "type": "llm.prediction.output",
-                "modelIdentifier": "test-model",
-                "stats": {
-                    "promptTokensCount": 10,
-                    "predictedTokensCount": 20,
-                    "totalTokensCount": 30,
-                    "tokensPerSecond": 15.5,
-                },
-                "output": "response text",
-            }
+    @patch("gpu_llm_monitor.fetch_traces")
+    @patch.dict(os.environ, {"LOCALAI_TRACES_URL": "http://localai:4012/api/traces"})
+    def test_new_trace_inserted_after_bootstrap(self, mock_fetch, mock_db, mock_sleep):
+        req = {"model": "qwen", "messages": [{"role": "user", "content": "hello"}]}
+        resp = json.dumps({
+            "id": "abc-123",
+            "model": "qwen",
+            "choices": [{"message": {"role": "assistant", "content": "hi there"}}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 10, "total_tokens": 15},
         })
-
-        proc = self._make_mock_proc([log_line])
-        mock_popen.return_value = proc
+        trace = _make_trace(req, resp)
+        # First fetch is the startup bootstrap (nothing yet); second is the real poll.
+        mock_fetch.side_effect = [[], [trace]]
 
         mock_conn = MagicMock()
         mock_conn.closed = False
         mock_db.return_value = mock_conn
-
         mock_cursor = MagicMock()
         mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
         mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        mock_sleep.side_effect = lambda s: (_ for _ in ()).throw(KeyboardInterrupt())
+
+        with pytest.raises(KeyboardInterrupt):
+            localai_trace_polling_thread()
+
+        mock_cursor.execute.assert_called_once()
+        params = mock_cursor.execute.call_args[0][1]
+        assert params[1] == "qwen"
+        assert params[2] == 5
+        assert params[3] == 10
+        assert params[4] == 15
+        assert params[6] == "hello"
+        assert params[7] == "hi there"
+
+    @patch("gpu_llm_monitor.time.sleep")
+    @patch("gpu_llm_monitor.get_db_connection")
+    @patch("gpu_llm_monitor.fetch_traces")
+    @patch.dict(os.environ, {"LOCALAI_TRACES_URL": "http://localai:4012/api/traces"})
+    def test_bootstrap_skips_traces_already_in_buffer(self, mock_fetch, mock_db, mock_sleep):
+        req = {"model": "qwen", "messages": [{"role": "user", "content": "hello"}]}
+        resp = json.dumps({
+            "id": "already-seen",
+            "model": "qwen",
+            "choices": [{"message": {"role": "assistant", "content": "hi"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        })
+        trace = _make_trace(req, resp)
+        # Same trace present at startup and on the first real poll -> must not be inserted.
+        mock_fetch.side_effect = [[trace], [trace]]
+
+        mock_sleep.side_effect = lambda s: (_ for _ in ()).throw(KeyboardInterrupt())
+
+        with pytest.raises(KeyboardInterrupt):
+            localai_trace_polling_thread()
+
+        mock_db.assert_not_called()
+
+    @patch("gpu_llm_monitor.time.sleep")
+    @patch("gpu_llm_monitor.fetch_traces")
+    @patch.dict(os.environ, {"LOCALAI_TRACES_URL": "http://localai:4012/api/traces"})
+    def test_fetch_failure_retries(self, mock_fetch, mock_sleep):
+        mock_fetch.side_effect = [[], Exception("network down")]
 
         call_count = [0]
 
@@ -201,111 +362,6 @@ class TestLmsLogProcessingThread:
         mock_sleep.side_effect = sleep_side_effect
 
         with pytest.raises(KeyboardInterrupt):
-            lms_log_processing_thread()
+            localai_trace_polling_thread()
 
-        mock_cursor.execute.assert_called()
-
-    @patch("gpu_llm_monitor.time.sleep")
-    @patch("gpu_llm_monitor.subprocess.Popen")
-    @patch("gpu_llm_monitor.get_db_connection")
-    def test_input_then_output_pairing(self, mock_db, mock_popen, mock_sleep):
-        input_line = json.dumps({
-            "data": {
-                "type": "llm.prediction.input",
-                "input": "hello world",
-                "modelIdentifier": "my-model",
-            }
-        })
-        output_line = json.dumps({
-            "data": {
-                "type": "llm.prediction.output",
-                "modelIdentifier": "my-model",
-                "stats": {
-                    "promptTokensCount": 5,
-                    "predictedTokensCount": 10,
-                    "totalTokensCount": 15,
-                    "tokensPerSecond": 25.0,
-                },
-                "output": "hi there",
-            }
-        })
-
-        proc = self._make_mock_proc([input_line, output_line])
-        mock_popen.return_value = proc
-
-        mock_conn = MagicMock()
-        mock_conn.closed = False
-        mock_db.return_value = mock_conn
-
-        mock_cursor = MagicMock()
-        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
-        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
-
-        mock_sleep.side_effect = lambda s: (_ for _ in ()).throw(KeyboardInterrupt())
-
-        with pytest.raises(KeyboardInterrupt):
-            lms_log_processing_thread()
-
-        insert_call = mock_cursor.execute.call_args
-        params = insert_call[0][1]
-        assert params[0] == "my-model"
-        assert params[1] == 5
-        assert params[2] == 10
-        assert params[3] == 15
-        assert params[4] == 25.0
-        assert params[5] == "hello world"
-        assert params[6] == "hi there"
-
-    @patch("gpu_llm_monitor.time.sleep")
-    @patch("gpu_llm_monitor.subprocess.Popen")
-    @patch("gpu_llm_monitor.get_db_connection")
-    def test_truncated_output_line(self, mock_db, mock_popen, mock_sleep):
-        truncated = '{"data":{"type":"llm.prediction.output","output":"some truncated text'
-
-        proc = self._make_mock_proc([truncated])
-        mock_popen.return_value = proc
-
-        mock_conn = MagicMock()
-        mock_conn.closed = False
-        mock_db.return_value = mock_conn
-
-        mock_cursor = MagicMock()
-        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
-        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
-
-        mock_sleep.side_effect = lambda s: (_ for _ in ()).throw(KeyboardInterrupt())
-
-        with pytest.raises(KeyboardInterrupt):
-            lms_log_processing_thread()
-
-    @patch("gpu_llm_monitor.time.sleep")
-    @patch("gpu_llm_monitor.subprocess.Popen")
-    @patch("gpu_llm_monitor.get_db_connection")
-    def test_empty_and_non_json_lines_skipped(self, mock_db, mock_popen, mock_sleep):
-        proc = self._make_mock_proc(["", "not json at all", "   "])
-        mock_popen.return_value = proc
-
-        mock_sleep.side_effect = lambda s: (_ for _ in ()).throw(KeyboardInterrupt())
-
-        with pytest.raises(KeyboardInterrupt):
-            lms_log_processing_thread()
-
-    @patch("gpu_llm_monitor.time.sleep")
-    @patch("gpu_llm_monitor.subprocess.Popen")
-    @patch("gpu_llm_monitor.get_db_connection")
-    def test_subprocess_failure_restarts(self, mock_db, mock_popen, mock_sleep):
-        mock_popen.side_effect = [Exception("spawn failed"), MagicMock()]
-
-        call_count = [0]
-
-        def sleep_side_effect(s):
-            call_count[0] += 1
-            if call_count[0] >= 2:
-                raise KeyboardInterrupt("stop")
-
-        mock_sleep.side_effect = sleep_side_effect
-
-        with pytest.raises(KeyboardInterrupt):
-            lms_log_processing_thread()
-
-        assert mock_popen.call_count >= 2
+        assert mock_fetch.call_count == 2

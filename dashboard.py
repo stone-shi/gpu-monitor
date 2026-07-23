@@ -10,7 +10,7 @@ st.set_page_config(
     layout="wide"
 )
 
-st.title("📊 GPU & LLM Studio Telemetry Dashboard")
+st.title("📊 GPU & LocalAI Telemetry Dashboard")
 st.markdown("Real-time monitoring of local hardware utilization and LLM inference telemetry.")
 
 # Sidebar Controls for Auto-Refresh
@@ -267,7 +267,7 @@ with tab2:
             st.markdown("**Response Text**")
             st.text_area("response_viewer", selected_run['response_text'], height=250, label_visibility="collapsed")
     else:
-        st.info("No LLM inferences logged yet. Generate text using LM Studio to populate.")
+        st.info("No LLM inferences logged yet. Generate text using LocalAI to populate.")
 
 def format_human(n):
     """Format a number into human-readable K, M, B notation."""

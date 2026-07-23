@@ -1,14 +1,14 @@
-# Local GPU & LM Studio Telemetry Monitor
+# Local GPU & LocalAI Telemetry Monitor
 
-A lightweight, stable background monitoring system that profiles local NVIDIA GPU usage alongside LM Studio token telemetry, committing all timeseries data into a PostgreSQL database for historical analysis and aggregation.
+A lightweight, stable background monitoring system that profiles local NVIDIA GPU usage alongside LocalAI token telemetry, committing all timeseries data into a PostgreSQL database for historical analysis and aggregation.
 
 ---
 
 ## Features
 
 - **GPU Hardware Polling (Thread 1)**: Utilizes NVIDIA Management Library (`pynvml`) to capture GPU utilization %, VRAM usage (MB), and core temperature every 10 seconds.
-- **LM Studio Telemetry Ingestion (Thread 2)**: Streams logs directly from the `lms` CLI, parses token usage and generation speed, correlates prompt and response events in memory, and writes complete records (with prompts/responses) to PostgreSQL.
-- **Fail-Safe & Auto-Recovery**: Robust exception isolation per thread loop handles network fluctuations, PostgreSQL connection drops, and LM Studio server restarts without crashing the master daemon.
+- **LocalAI Telemetry Ingestion (Thread 2)**: Polls LocalAI's `/api/traces` HTTP endpoint, decodes the request/response bodies of each chat completion, parses token usage and generation speed (including streamed responses), and writes complete records (with prompts/responses) to PostgreSQL.
+- **Fail-Safe & Auto-Recovery**: Robust exception isolation per thread loop handles network fluctuations, PostgreSQL connection drops, and LocalAI restarts without crashing the master daemon.
 - **Systemd Daemon Integration**: Configured to run under user authority with automatic boot-time startup and recovery policies.
 - **Formatted CLI Inspector**: Includes a custom CLI utility (`query_stats.py`) to query and aggregate historical data.
 
@@ -29,7 +29,7 @@ A lightweight, stable background monitoring system that profiles local NVIDIA GP
 The daemon requires the following dependencies:
 - **Operating System**: Linux (Ubuntu/Debian recommended)
 - **NVIDIA GPU** with drivers installed
-- **LM Studio** CLI (`lms`) installed and running
+- **LocalAI** running and reachable over HTTP (its `/api/traces` endpoint)
 - **PostgreSQL** server running locally
 - **Python Modules**:
   ```bash

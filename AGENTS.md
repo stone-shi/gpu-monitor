@@ -1,5 +1,7 @@
 # Agent Task: Local GPU & LM Studio Telemetry Monitor
 
+See [CLAUDE.md](./CLAUDE.md) for repository commands, architecture, and conventions to follow while working on this task.
+
 ## Goal
 Create a lightweight, highly stable background monitoring system that profiles local NVIDIA GPU usage alongside LM Studio token telemetry, committing all timeseries data into a PostgreSQL database backend for historical aggregation.
 

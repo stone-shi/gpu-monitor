@@ -1,12 +1,12 @@
 [Unit]
-Description=NVIDIA GPU and LM Studio Token Telemetry Monitor Daemon
+Description=NVIDIA GPU and LocalAI Token Telemetry Monitor Daemon
 After=network.target postgresql.service
 
 [Service]
 Type=simple
 User=stoneshi
 WorkingDirectory=/home/stoneshi/data/src/stone/gpu-monitor
-Environment="PATH=/home/stoneshi/.lmstudio/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 Environment="PYTHONUNBUFFERED=1"
 ExecStart=/usr/bin/python3 /home/stoneshi/data/src/stone/gpu-monitor/gpu_llm_monitor.py
 Restart=always

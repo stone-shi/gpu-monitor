@@ -3,9 +3,12 @@ import os
 import sys
 import time
 import json
-import subprocess
+import base64
 import threading
 import collections
+import urllib.request
+import urllib.error
+from datetime import datetime
 import psycopg2
 import pynvml
 
@@ -115,222 +118,228 @@ def hardware_polling_thread():
             
         time.sleep(10)
 
-def extract_truncated_json_field(line, field_name):
-    """Helper to extract a string field from a truncated JSON line."""
-    for marker in [f'"{field_name}":"', f'"{field_name}": "']:
-        idx = line.find(marker)
-        if idx != -1:
-            start_idx = idx + len(marker)
-            content = line[start_idx:].rstrip('\r\n')
-            
-            # Handle trailing backslashes to avoid escaping the closing quote we append
-            backslash_count = 0
-            for char in reversed(content):
-                if char == '\\':
-                    backslash_count += 1
-                else:
-                    break
-            if backslash_count % 2 != 0:
-                content = content[:-1]
-                
-            try:
-                return json.loads(f'"{content}"')
-            except json.JSONDecodeError:
-                if content.endswith('"'):
-                    content = content[:-1]
-                    backslash_count = 0
-                    for char in reversed(content):
-                        if char == '\\':
-                            backslash_count += 1
-                        else:
-                            break
-                    if backslash_count % 2 != 0:
-                        content = content[:-1]
-                try:
-                    return json.loads(f'"{content}"')
-                except json.JSONDecodeError:
-                    # Manual fallback unescape
-                    return content.replace('\\n', '\n').replace('\\t', '\t').replace('\\"', '"').replace('\\\\', '\\')
+def fetch_traces(url, api_key, timeout=10):
+    """Fetches the current LocalAI /api/traces buffer (newest-first list of request/response records)."""
+    req = urllib.request.Request(url)
+    if api_key:
+        req.add_header("Authorization", f"Bearer {api_key}")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+def parse_trace_timestamp(ts_raw):
+    """Parses LocalAI's nanosecond-precision RFC3339 timestamp, truncated to microsecond precision."""
+    if not ts_raw:
+        return None
+    ts_raw = ts_raw.strip()
+    if ts_raw.endswith("Z"):
+        ts_raw = ts_raw[:-1] + "+00:00"
+    if "." in ts_raw:
+        base, frac_and_tz = ts_raw.split(".", 1)
+        tz_idx = next((i for i, ch in enumerate(frac_and_tz) if ch in "+-"), len(frac_and_tz))
+        frac, tz = frac_and_tz[:tz_idx], frac_and_tz[tz_idx:]
+        ts_raw = f"{base}.{frac[:6]}{tz}"
+    try:
+        return datetime.fromisoformat(ts_raw)
+    except ValueError:
+        return None
+
+def extract_last_user_message(messages):
+    """Extracts the most recent user message's text from an OpenAI-style chat `messages` array."""
+    if not isinstance(messages, list):
+        return None
+    for msg in reversed(messages):
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            texts = [part.get("text") for part in content if isinstance(part, dict) and part.get("type") == "text"]
+            return "\n".join(t for t in texts if t) or None
     return None
 
-def lms_log_processing_thread():
-    """Thread 2: Consumes LM Studio log stream and commits LLM token and text metrics to database."""
-    print("Starting LM Studio Log Processing Thread...", file=sys.stderr)
-    conn = None
-    # Use a FIFO queue to buffer (prompt_text, model_name) for correct correlation with parallel requests.
-    # When multiple inputs arrive before their outputs (parallel inference), each input
-    # is queued and each output pops the oldest prompt/model from the front.
-    prompt_queue = collections.deque()
-    
-    while True:
-        proc = None
+def parse_streaming_response(body_text):
+    """Reconstructs (trace_id, model_name, response_text, usage) from an SSE chat.completion.chunk stream."""
+    trace_id = None
+    model_name = None
+    usage = None
+    content_parts = []
+    for line in body_text.splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        data = line[len("data:"):].strip()
+        if not data or data == "[DONE]":
+            continue
         try:
-            print("Spawning lms log stream subprocess...", file=sys.stderr)
-            proc = subprocess.Popen(
-                ["lms", "log", "stream", "--source", "model", "--filter", "input,output", "--json"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True
-            )
-            
-            # Read streaming output line by line
-            while True:
-                line = proc.stdout.readline()
-                if not line:
-                    print("lms log stream subprocess output ended.", file=sys.stderr)
-                    break
-                
-                line = line.strip()
-                if not line:
-                    continue
-                
-                is_truncated = False
-                event_type = None
-                data_obj = {}
-                payload = {}
-                
-                # Try parsing line as JSON payload
-                try:
-                    payload = json.loads(line)
-                    data_obj = payload.get("data", {})
-                    if not isinstance(data_obj, dict) or not data_obj:
-                        data_obj = payload
-                    event_type = data_obj.get("type")
-                except json.JSONDecodeError:
-                    is_truncated = True
-                    # Truncated line: identify event type by simple substring
-                    if "llm.prediction.input" in line:
-                        event_type = "llm.prediction.input"
-                    elif "llm.prediction.output" in line:
-                        event_type = "llm.prediction.output"
-                    else:
-                        continue
-                
-                # If it's an input event, enqueue the prompt text and continue
-                if event_type == "llm.prediction.input":
-                    if is_truncated:
-                        prompt = extract_truncated_json_field(line, "input")
-                        model_name = None
-                    else:
-                        prompt = data_obj.get("input")
-                        model_name = data_obj.get("modelIdentifier") or data_obj.get("model") or payload.get("model")
-                    
-                    if prompt:
-                        prompt_queue.append((prompt, model_name))
-                    continue
-                
-                # If it's an output event, process metrics and insert
-                if event_type == "llm.prediction.output" or "stats" in data_obj or "usage" in data_obj:
-                    # Pop the oldest buffered prompt/model for this output (FIFO correlation)
-                    matched_prompt, input_model = prompt_queue.popleft() if prompt_queue else (None, None)
-                    
-                    if is_truncated:
-                        response_text = extract_truncated_json_field(line, "output")
-                        model_name = input_model or "unknown"
-                        prompt_tokens = len(matched_prompt) // 4 if matched_prompt else 0
-                        completion_tokens = len(response_text) // 4 if response_text else 0
-                        total_tokens = prompt_tokens + completion_tokens
-                        tokens_per_sec = 0.0
-                    else:
-                        stats = data_obj.get("stats", {}) or data_obj.get("usage", {})
-                        if not isinstance(stats, dict):
-                            stats = {}
-                        
-                        model_name = data_obj.get("modelIdentifier") or data_obj.get("model") or payload.get("model") or input_model or "unknown"
-                        prompt_tokens = stats.get("promptTokensCount") or stats.get("prompt_tokens") or stats.get("input_tokens") or stats.get("prompt")
-                        completion_tokens = stats.get("predictedTokensCount") or stats.get("completion_tokens") or stats.get("output_tokens") or stats.get("completion")
-                        total_tokens = stats.get("totalTokensCount") or stats.get("total_tokens")
-                        tokens_per_sec = stats.get("tokensPerSecond") or stats.get("tokens_per_sec") or stats.get("t/s")
-                        response_text = data_obj.get("output")
-                        
-                        # Cast metrics safely
-                        try:
-                            if prompt_tokens is not None:
-                                prompt_tokens = int(prompt_tokens)
-                        except (TypeError, ValueError):
-                            prompt_tokens = None
-                            
-                        try:
-                            if completion_tokens is not None:
-                                completion_tokens = int(completion_tokens)
-                        except (TypeError, ValueError):
-                            completion_tokens = None
-                            
-                        try:
-                            if total_tokens is not None:
-                                total_tokens = int(total_tokens)
-                        except (TypeError, ValueError):
-                            total_tokens = None
-                        
-                        try:
-                            if tokens_per_sec is not None:
-                                tokens_per_sec = float(tokens_per_sec)
-                        except (TypeError, ValueError):
-                            tokens_per_sec = 0.0
-                            
-                        if prompt_tokens is None:
-                            prompt_tokens = len(matched_prompt) // 4 if matched_prompt else 0
-                        if completion_tokens is None:
-                            completion_tokens = len(response_text) // 4 if response_text else 0
-                        if total_tokens is None:
-                            total_tokens = prompt_tokens + completion_tokens
-                        if tokens_per_sec is None:
-                            tokens_per_sec = 0.0
+            chunk = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+        trace_id = trace_id or chunk.get("id")
+        model_name = model_name or chunk.get("model")
+        usage = chunk.get("usage") or usage
+        choices = chunk.get("choices") or []
+        if choices:
+            piece = (choices[0].get("delta") or {}).get("content")
+            if piece:
+                content_parts.append(piece)
+    return trace_id, model_name, "".join(content_parts), usage
 
-                    # If we have minimum valid fields, insert into database
-                    if model_name and prompt_tokens is not None and completion_tokens is not None:
-                        if total_tokens is None:
-                            total_tokens = prompt_tokens + completion_tokens
-                        if tokens_per_sec is None:
-                            tokens_per_sec = 0.0
-                            
-                        db_inserted = False
-                        while not db_inserted:
-                            try:
-                                if conn is None or conn.closed:
-                                    conn = get_db_connection()
-                                    print("LM Studio Thread connected to database.", file=sys.stderr)
-                                
-                                with conn.cursor() as cur:
-                                    cur.execute(
-                                        """
-                                        INSERT INTO llm_token_metrics 
-                                        (model_name, prompt_tokens, completion_tokens, total_tokens, tokens_per_sec, prompt_text, response_text)
-                                        VALUES (%s, %s, %s, %s, %s, %s, %s)
-                                        """,
-                                        (model_name, prompt_tokens, completion_tokens, total_tokens, tokens_per_sec, matched_prompt, response_text)
-                                    )
-                                conn.commit()
-                                db_inserted = True
-                            except Exception as e:
-                                print(f"LM Studio Thread DB insertion failed: {e}. Closing connection.", file=sys.stderr)
-                                try:
-                                    if conn:
-                                        conn.close()
-                                except Exception:
-                                    pass
-                                conn = None
-                                # Sleep briefly before retrying database insertion
-                                time.sleep(2)
-                
+def parse_json_response(body_text):
+    """Extracts (trace_id, model_name, response_text, usage) from a non-streaming chat.completion body."""
+    try:
+        body = json.loads(body_text)
+    except json.JSONDecodeError:
+        return None, None, None, None
+    choices = body.get("choices") or []
+    response_text = (choices[0].get("message") or {}).get("content") if choices else None
+    return body.get("id"), body.get("model"), response_text, body.get("usage")
+
+def process_trace(entry):
+    """Turns one /api/traces entry into an llm_token_metrics record, or None if it isn't a usable chat completion."""
+    request = entry.get("request") or {}
+    response = entry.get("response") or {}
+    if request.get("path") != "/v1/chat/completions" or response.get("status") != 200:
+        return None
+
+    try:
+        req_body = json.loads(base64.b64decode(request.get("body", "")).decode("utf-8", "replace"))
+    except (ValueError, json.JSONDecodeError):
+        req_body = {}
+
+    resp_raw = base64.b64decode(response.get("body", "")).decode("utf-8", "replace")
+    if resp_raw.lstrip().startswith("data:"):
+        trace_id, model_name, response_text, usage = parse_streaming_response(resp_raw)
+    else:
+        trace_id, model_name, response_text, usage = parse_json_response(resp_raw)
+
+    if not trace_id:
+        return None
+
+    model_name = model_name or req_body.get("model") or "unknown"
+    prompt_text = extract_last_user_message(req_body.get("messages"))
+
+    usage = usage or {}
+    prompt_tokens = usage.get("prompt_tokens")
+    completion_tokens = usage.get("completion_tokens")
+    total_tokens = usage.get("total_tokens")
+    if prompt_tokens is None:
+        prompt_tokens = len(prompt_text) // 4 if prompt_text else 0
+    if completion_tokens is None:
+        completion_tokens = len(response_text) // 4 if response_text else 0
+    if total_tokens is None:
+        total_tokens = prompt_tokens + completion_tokens
+
+    duration_s = (entry.get("duration") or 0) / 1_000_000_000
+    tokens_per_sec = (completion_tokens / duration_s) if duration_s > 0 and completion_tokens else 0.0
+
+    return {
+        "trace_id": trace_id,
+        "timestamp": parse_trace_timestamp(entry.get("timestamp")),
+        "model_name": model_name,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+        "tokens_per_sec": tokens_per_sec,
+        "prompt_text": prompt_text,
+        "response_text": response_text,
+    }
+
+def localai_trace_polling_thread():
+    """Thread 2: Polls LocalAI's /api/traces endpoint and commits LLM token and text metrics to database."""
+    print("Starting LocalAI Trace Polling Thread...", file=sys.stderr)
+    traces_url = os.environ.get("LOCALAI_TRACES_URL", "")
+    api_key = os.environ.get("LOCALAI_API_KEY", "")
+    poll_interval = float(os.environ.get("LOCALAI_POLL_INTERVAL", "5"))
+
+    if not traces_url:
+        print("LOCALAI_TRACES_URL not set. LocalAI Trace Polling Thread exiting.", file=sys.stderr)
+        return
+
+    conn = None
+    # Bounded FIFO of trace ids already handled, so a fresh /api/traces poll never
+    # double-inserts an entry still sitting in LocalAI's ring buffer.
+    seen_ids = set()
+    seen_order = collections.deque()
+    MAX_SEEN = 5000
+
+    def mark_seen(trace_id):
+        seen_ids.add(trace_id)
+        seen_order.append(trace_id)
+        if len(seen_order) > MAX_SEEN:
+            seen_ids.discard(seen_order.popleft())
+
+    # Bootstrap: mark whatever is already in the trace buffer as seen without inserting it,
+    # so restarting the daemon doesn't replay completions already recorded on a prior run.
+    try:
+        for entry in fetch_traces(traces_url, api_key):
+            record = process_trace(entry)
+            if record:
+                mark_seen(record["trace_id"])
+    except Exception as e:
+        print(f"Initial LocalAI trace fetch failed: {e}", file=sys.stderr)
+
+    while True:
+        try:
+            traces = fetch_traces(traces_url, api_key)
         except Exception as e:
-            print(f"Error in LM Studio thread loop: {e}", file=sys.stderr)
-        
-        # Clean up subprocess if alive
-        if proc:
+            print(f"Failed to fetch LocalAI traces: {e}. Retrying in {poll_interval}s...", file=sys.stderr)
+            time.sleep(poll_interval)
+            continue
+
+        # Traces come back newest-first; walk oldest-first so inserts land in chronological order.
+        for entry in reversed(traces):
             try:
-                proc.terminate()
-                proc.wait(timeout=2)
-            except Exception:
+                record = process_trace(entry)
+            except Exception as e:
+                print(f"Failed to parse LocalAI trace entry: {e}", file=sys.stderr)
+                continue
+
+            if not record or record["trace_id"] in seen_ids:
+                continue
+            mark_seen(record["trace_id"])
+
+            db_inserted = False
+            while not db_inserted:
                 try:
-                    proc.kill()
-                except Exception:
-                    pass
-        
-        # Clear stale prompts on subprocess restart
-        prompt_queue.clear()
-        print("LM Studio subprocess connection lost or failed. Re-trying in 5 seconds...", file=sys.stderr)
-        time.sleep(5)
+                    if conn is None or conn.closed:
+                        conn = get_db_connection()
+                        print("LocalAI Trace Thread connected to database.", file=sys.stderr)
+
+                    with conn.cursor() as cur:
+                        if record["timestamp"] is not None:
+                            cur.execute(
+                                """
+                                INSERT INTO llm_token_metrics
+                                (timestamp, model_name, prompt_tokens, completion_tokens, total_tokens, tokens_per_sec, prompt_text, response_text)
+                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                                """,
+                                (record["timestamp"], record["model_name"], record["prompt_tokens"], record["completion_tokens"],
+                                 record["total_tokens"], record["tokens_per_sec"], record["prompt_text"], record["response_text"])
+                            )
+                        else:
+                            cur.execute(
+                                """
+                                INSERT INTO llm_token_metrics
+                                (model_name, prompt_tokens, completion_tokens, total_tokens, tokens_per_sec, prompt_text, response_text)
+                                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                                """,
+                                (record["model_name"], record["prompt_tokens"], record["completion_tokens"],
+                                 record["total_tokens"], record["tokens_per_sec"], record["prompt_text"], record["response_text"])
+                            )
+                    conn.commit()
+                    db_inserted = True
+                except Exception as e:
+                    print(f"LocalAI Trace Thread DB insertion failed: {e}. Closing connection.", file=sys.stderr)
+                    try:
+                        if conn:
+                            conn.close()
+                    except Exception:
+                        pass
+                    conn = None
+                    time.sleep(2)
+
+        time.sleep(poll_interval)
 
 def main():
     # Load environment variables from the .env next to the script
@@ -342,7 +351,7 @@ def main():
     
     # Run the worker threads
     t1 = threading.Thread(target=hardware_polling_thread, name="HardwarePolling", daemon=True)
-    t2 = threading.Thread(target=lms_log_processing_thread, name="LMSLogProcessing", daemon=True)
+    t2 = threading.Thread(target=localai_trace_polling_thread, name="LocalAITracePolling", daemon=True)
     
     t1.start()
     t2.start()
